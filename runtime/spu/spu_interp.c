@@ -407,6 +407,13 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        /* Policy exit is an HLE service, not an instruction in local store.
+         * Reuse dispatch's exit flag, stop status and nonlocal halt contract. */
+        if (ctx->policy_mode && ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
+            g_spu_interp_steps = steps;
+            spu_indirect_branch(ctx);
+            return ctx->pc; /* The service may return when no halt frame is armed. */
+        }
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
          * Preserve the legacy CRI return convention while invoking the HLE. */
