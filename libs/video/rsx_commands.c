@@ -665,6 +665,39 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_attrib_output_mask = data;
         return 0;
     }
+    /* DATA2F occupies two words per attribute. The omitted components are
+     * (Z=0,W=1), independently of older DATA4F values or array declarations.
+     * Only a complete ATTR0 pair inside BEGIN commits a vertex. */
+    if (method >= NV4097_SET_VERTEX_DATA2F_M &&
+        method < NV4097_SET_VERTEX_DATA2F_M + RSX_MAX_VERTEX_ATTRIBS * 8u &&
+        (method & 3u) == 0) {
+        u32 reg = method - NV4097_SET_VERTEX_DATA2F_M;
+        u32 attr = reg / 8u, lane = (reg / 4u) & 1u;
+        float value;
+        memcpy(&value, &data, sizeof value);
+        state->vertex_data4f[attr][lane] = value;
+        state->vertex_data4f[attr][2] = 0.0f;
+        state->vertex_data4f[attr][3] = 1.0f;
+        if (attr == 0 && state->in_begin_end) {
+            state->immediate_started = 1;
+            if (state->explicit_draw_seen) state->immediate_invalid = 1;
+            if (lane == 0) {
+                state->immediate_position_pending = 1;
+            } else {
+                if (!state->immediate_position_pending ||
+                    state->immediate_count == RSX_MAX_IMMEDIATE_VERTICES)
+                    state->immediate_invalid = 1;
+                if (!state->immediate_invalid) {
+                    memcpy(state->immediate_vertices[state->immediate_count].attrib,
+                           state->vertex_data4f, sizeof state->vertex_data4f);
+                    state->immediate_count++;
+                }
+                state->immediate_position_pending = 0;
+            }
+        }
+        return 0;
+    }
+
     /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
      * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
      * every vertex when the attribute's ARRAY is disabled -- it is not zero.
@@ -673,13 +706,19 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * instead; its duck shader computes (lighting * col0) * texture + spec, so a
      * zero col0 multiplies the texture away and the ducks rendered as a dim grey
      * specular term only -- present in the framebuffer, invisible on screen.
-     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
+     * SET_VERTEX_DATA4UB/2S/4S are other encodings of the same register
      * file; add them if a title needs them. */
     if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
         u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
+        /* ATTR0 DATA4F is not an implemented immediate position encoding on
+         * this path. Do not splice it into a pending DATA2F pair or silently
+         * discard its vertices in a group containing supported positions. */
+        if (idx == 0 && state->in_begin_end) {
+            state->immediate_invalid = 1;
+        }
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
           if (_d && _n < 400) { _n++;
@@ -748,6 +787,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
+            state->immediate_count = 0;
+            state->immediate_position_pending = 0;
+            state->immediate_started = 0;
+            state->immediate_invalid = 0;
+            state->explicit_draw_seen = 0;
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
@@ -793,12 +837,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 state->texture_dirty = 0;
             }
         } else {
+            if (state->in_begin_end && state->immediate_count &&
+                !state->immediate_invalid && !state->immediate_position_pending &&
+                !state->explicit_draw_seen && s_backend && s_backend->draw_immediate)
+                s_backend->draw_immediate(s_backend->userdata, state->primitive_type,
+                                          state->immediate_vertices, state->immediate_count);
             state->in_begin_end = 0;
+            state->immediate_count = 0;
+            state->immediate_position_pending = 0;
+            state->immediate_started = 0;
+            state->immediate_invalid = 0;
+            state->explicit_draw_seen = 0;
         }
         return 0;
     }
 
     if (method == NV4097_DRAW_ARRAYS) {
+        if (state->in_begin_end) {
+            state->explicit_draw_seen = 1;
+            if (state->immediate_started) {
+                state->immediate_invalid = 1;
+                return 0;
+            }
+        }
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (PS3_LOG_FIRST(_d, 32)) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
@@ -843,6 +904,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
+        if (state->in_begin_end) {
+            state->explicit_draw_seen = 1;
+            if (state->immediate_started) {
+                state->immediate_invalid = 1;
+                return 0;
+            }
+        }
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
@@ -852,6 +920,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
                                     first, count);
         return 0;
+    }
+
+    /* INLINE_ARRAY is still unsupported on this path. Record its presence
+     * even for a malformed/empty stream so it cannot escape mixed rejection. */
+    if (method == NV4097_INLINE_ARRAY && state->in_begin_end) {
+        state->explicit_draw_seen = 1;
+        if (state->immediate_started) state->immediate_invalid = 1;
+        return -1;
     }
 
     /* Scissor */

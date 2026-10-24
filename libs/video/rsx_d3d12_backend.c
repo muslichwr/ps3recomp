@@ -5471,6 +5471,12 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
 typedef struct { float v[4]; } VPSlot;
 #define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
 
+/* Set only during the synchronous immediate callback. Existing primitive
+ * uploaders still rebuild topology, but their source is the committed host
+ * payload, never stale guest array declarations or current registers. */
+static const rsx_immediate_vertex* s_immediate_vertices;
+static u32 s_immediate_count;
+
 
 void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
 
@@ -5479,6 +5485,13 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
  * same way this one does, rather than each porting the logic again. */
 static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
+    if (s_immediate_vertices) {
+        if (vi < s_immediate_count)
+            memcpy(out16, s_immediate_vertices[vi].attrib, VP_VERT_STRIDE);
+        else
+            memset(out16, 0, VP_VERT_STRIDE);
+        return;
+    }
     for (int i = 0; i < 16; i++) {
         rsx_fetch_attrib(state, i, vi, out16[i].v);
         if (i == 0) {
@@ -5614,9 +5627,9 @@ static void vp_attrs_dbg(const rsx_state* state)
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
-    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
-    if (!state->vertex_attribs[0].enabled) return 0;
-    vp_attrs_dbg(state);
+    if (!state || !s_d3d.vp_vb_mapped) return 0;
+    if (!s_immediate_vertices && (!vm_base || !state->vertex_attribs[0].enabled)) return 0;
+    if (!s_immediate_vertices) vp_attrs_dbg(state);
     u32 quads = count / 4;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (quads * 6 > maxv) quads = maxv / 6;
@@ -5648,9 +5661,9 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
     s_req_verts += count; s_req_draws++;
-    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
-    if (!state->vertex_attribs[0].enabled) return 0;
-    vp_attrs_dbg(state);
+    if (!state || !s_d3d.vp_vb_mapped) return 0;
+    if (!s_immediate_vertices && (!vm_base || !state->vertex_attribs[0].enabled)) return 0;
+    if (!s_immediate_vertices) vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && PS3_LOG_FIRST(_n, 12))
@@ -5714,8 +5727,8 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
 static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan)
 {
     extern uint8_t* vm_base;
-    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
-    if (!state->vertex_attribs[0].enabled) return 0;
+    if (!state || !s_d3d.vp_vb_mapped) return 0;
+    if (!s_immediate_vertices && (!vm_base || !state->vertex_attribs[0].enabled)) return 0;
     if (count < 3) return 0;
     u32 tris = count - 2;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
@@ -6287,6 +6300,33 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
 }
 
+static void d3d12_draw_immediate(void* ud, u32 primitive,
+                               const rsx_immediate_vertex* vertices, u32 count)
+{
+    /* Require the real VP path: a fixed-function fallback cannot represent
+     * arbitrary attribute semantics. Unsupported expansions remain rejected.
+     * Reserve the entire expanded group, rather than rendering a prefix. */
+    if (!vertices || !count || count > RSX_MAX_IMMEDIATE_VERTICES ||
+        !s_d3d.current_rsx_state || s_d3d.current_rsx_state->vp_ucode_bytes < 16 ||
+        !s_d3d.pipeline_ready || !s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig ||
+        s_d3d.draw_count >= MAX_DRAWS) return;
+    u32 emitted = count;
+    if (primitive == RSX_PRIMITIVE_QUADS) emitted = (count / 4u) * 6u;
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN)
+        emitted = count >= 3 ? (count - 2u) * 3u : 0;
+    else if (primitive != RSX_PRIMITIVE_TRIANGLES) return;
+    if (!emitted || s_d3d.vp_vb_offset > MAX_VERTICES * VP_VERT_STRIDE ||
+        emitted > (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE) return;
+
+    s_d3d.merge_prev_draw = 0;
+    s_immediate_vertices = vertices;
+    s_immediate_count = count;
+    d3d12_draw_arrays(ud, primitive, 0, count);
+    s_immediate_vertices = NULL;
+    s_immediate_count = 0;
+    s_d3d.merge_prev_draw = 0;
+}
+
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
 {
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
@@ -6688,6 +6728,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d12_backend.set_vertex_attribs = d3d12_set_vertex_attribs;
     s_d3d12_backend.draw_arrays       = d3d12_draw_arrays;
     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
+    s_d3d12_backend.draw_immediate    = d3d12_draw_immediate;
     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
 
     rsx_set_backend(&s_d3d12_backend);

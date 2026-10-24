@@ -102,11 +102,13 @@ extern "C" {
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
+#define NV4097_INLINE_ARRAY                    0x00001818
 #define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
 #define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
 #define NV4097_DRAW_INDEX_ARRAY                0x00001824
 
 /* Vertex attributes */
+#define NV4097_SET_VERTEX_DATA2F_M              0x00001880
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
 
@@ -221,6 +223,14 @@ extern "C" {
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
 
+/* Fixed FIFO-driven storage: no allocation and no truncated overflow draw. */
+/* Keep rsx_state usable on ordinary host stacks (existing callers use local
+ * states). 1024 vertices occupy 256 KiB; overflow rejects the entire group. */
+#define RSX_MAX_IMMEDIATE_VERTICES 1024u
+typedef struct rsx_immediate_vertex {
+    float attrib[RSX_MAX_VERTEX_ATTRIBS][4];
+} rsx_immediate_vertex;
+
 typedef struct rsx_texture_state {
     u32 offset;
     u32 format;
@@ -322,6 +332,15 @@ typedef struct rsx_state {
     /* Current draw state */
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
+
+    /* DATA2F ATTR0 completes at Y. Current attributes persist across groups;
+     * these immutable vertex snapshots and delivery flags do not. */
+    rsx_immediate_vertex immediate_vertices[RSX_MAX_IMMEDIATE_VERTICES];
+    u32 immediate_count;
+    int immediate_position_pending;
+    int immediate_started;
+    int immediate_invalid;
+    int explicit_draw_seen;
 
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
@@ -434,6 +453,11 @@ typedef struct rsx_backend {
 
     /* Texture */
     void (*bind_texture)(void* userdata, u32 unit, const rsx_texture_state* tex);
+
+    /* Synchronous register-fed payload. Consume/copy before returning; the
+     * caller resets group storage after END. Never fetch guest arrays here. */
+    void (*draw_immediate)(void* userdata, u32 primitive,
+                           const rsx_immediate_vertex* vertices, u32 count);
 } rsx_backend;
 
 /* Register a backend. Call before any RSX processing. */
