@@ -17,6 +17,7 @@
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
+#include "ps3emu/error_codes.h"
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,8 @@ extern "C" void ydkj_host_bt(const char* tag);
 #ifdef _WIN32
 #  define FS_SEEK64(f, o, w) _fseeki64((f), (int64_t)(o), (w))
 #  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
+#  define HOST_LOCKFILE(f)    _lock_file(f)
+#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
 typedef struct _stat64 fs_stat64_t;
 /* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
 static int FS_STAT64(const char* p, fs_stat64_t* s)
@@ -65,6 +68,8 @@ static int FS_STAT64(const char* p, fs_stat64_t* s)
 #else
 #  define FS_SEEK64(f, o, w) fseeko((f), (off_t)(o), (w))
 #  define FS_TELL64(f)       ((int64_t)ftello(f))
+#  define HOST_LOCKFILE(f)    flockfile(f)
+#  define HOST_UNLOCKFILE(f)  funlockfile(f)
 #  define FS_STAT64(p, s)    stat((p), (s))
 typedef struct stat fs_stat64_t;
 #endif
@@ -82,7 +87,6 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
 extern "C" const char* ppu_vfs_root = ".";
 
 /* CELL_FS return / mode / flag constants. */
-#define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
@@ -205,14 +209,17 @@ static void host_path(char* out, size_t cap, const char* guest)
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
+static bool g_fd_writable[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
-static int fd_alloc_file(FILE* f)
+static int fd_alloc_file(FILE* f, bool writable = false)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) {
+        g_files[i] = f; g_fd_writable[i] = writable; return i;
+    }
     return -1;
 }
 static int fd_alloc_dir(DIR* d)
@@ -276,7 +283,7 @@ static void cellFsOpen(ppu_context* ctx)
         close(hfd);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f, acc != CELL_FS_O_RDONLY);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
@@ -399,7 +406,7 @@ static void cellFsClose(ppu_context* ctx)
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0; g_fd_writable[fd] = false;
     }
     ctx->gpr[3] = CELL_OK;
 }
@@ -590,6 +597,55 @@ static void cellFsLseek(ppu_context* ctx)
     int64_t p = FS_TELL64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
+}
+
+static void cellFsFtruncate(ppu_context* ctx)
+{
+    int fd = (int)(uint32_t)ctx->gpr[3];
+    uint64_t size = ctx->gpr[4];
+    uint32_t result = CELL_OK;
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd] || !g_fd_writable[fd]) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBADF; return;
+    }
+    // The guest size is unsigned; host resize/seek APIs take signed lengths.
+    if (size > INT64_MAX) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL; return;
+    }
+#ifndef _WIN32
+    if ((off_t)size < 0 || (uint64_t)(off_t)size != size) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL; return;
+    }
+#endif
+    FILE* f = g_files[fd];
+    HOST_LOCKFILE(f);
+    struct StreamUnlock { FILE* f; ~StreamUnlock() { HOST_UNLOCKFILE(f); } } unlock{f};
+    int64_t position = FS_TELL64(f);
+    // Commit pending output before changing EOF. Seek only after resizing:
+    // a pre-resize seek can refill buffered input with bytes about to be removed.
+    int error = 0;
+    if (position < 0 || fflush(f) != 0)
+        error = errno ? errno : EIO;
+    else {
+#ifdef _WIN32
+        error = _chsize_s(_fileno(f), (int64_t)size);
+#else
+        error = ftruncate(fileno(f), (off_t)size) == 0 ? 0 : errno;
+#endif
+        // Keep the FILE* position even when it lies beyond the new EOF. Do not
+        // report success if resynchronizing the stream fails after the resize.
+        if (FS_SEEK64(f, position, SEEK_SET) != 0 && !error) error = errno ? errno : EIO;
+    }
+    if (error) {
+        switch (error) {
+        case EBADF:  result = CELL_EBADF; break;
+        case EINVAL: result = CELL_EINVAL; break;
+        case EACCES: result = CELL_EACCES; break;
+        case ENOSPC: result = CELL_ENOSPC; break;
+        case EFBIG:  result = CELL_EFBIG; break;
+        default:     result = CELL_EIO; break;
+        }
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
 }
 
 /* CellFsStat is 0x34 (52) bytes, 4-byte aligned -- the s64/u64 members are
@@ -846,13 +902,9 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
 #ifdef _WIN32
 #  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
 #  define HOST_FTELL64(f)     _ftelli64(f)
-#  define HOST_LOCKFILE(f)    _lock_file(f)
-#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
 #else
 #  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
 #  define HOST_FTELL64(f)     ftello(f)
-#  define HOST_LOCKFILE(f)    flockfile(f)
-#  define HOST_UNLOCKFILE(f)  funlockfile(f)
 #endif
 
 static uint32_t guest_be32(uint32_t a)
@@ -929,6 +981,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
+    ps3_hle_register_ctx(0x0E2939E5u, "cellFsFtruncate", cellFsFtruncate);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
